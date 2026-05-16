@@ -17,10 +17,8 @@ from dataclasses import dataclass
 
 import requests
 
-KUCOIN_API = "https://api.kucoin.com/api/v1/market/candles"
-
-# KuCoin beantwortet Anfragen mit dem Standard-User-Agent von ``requests``
-# haeufig mit HTTP 403; ein Browser-aehnlicher Header umgeht das.
+# Manche Boersen-APIs beantworten den Standard-User-Agent von ``requests``
+# mit HTTP 403; ein Browser-aehnlicher Header umgeht das.
 HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -28,7 +26,7 @@ HTTP_HEADERS = {
     )
 }
 
-# Erlaubte KuCoin-Candle-Typen (Mapping auf eine ungefaehre Dauer in Sekunden).
+# Erlaubte Candle-Typen (kanonische Namen, Mapping auf die Dauer in Sekunden).
 CANDLE_TYPES: dict[str, int] = {
     "1min": 60,
     "5min": 300,
@@ -38,6 +36,16 @@ CANDLE_TYPES: dict[str, int] = {
     "4hour": 14400,
     "1day": 86400,
     "1week": 604800,
+}
+
+# Uebersetzung der kanonischen Intervallnamen in das jeweilige Boersenformat.
+_BINANCE_INTERVALS = {
+    "1min": "1m", "5min": "5m", "15min": "15m", "30min": "30m",
+    "1hour": "1h", "4hour": "4h", "1day": "1d", "1week": "1w",
+}
+_KRAKEN_INTERVALS = {
+    "1min": 1, "5min": 5, "15min": 15, "30min": 30,
+    "1hour": 60, "4hour": 240, "1day": 1440, "1week": 10080,
 }
 
 
@@ -53,59 +61,147 @@ class Candle:
     volume: float
 
 
+def _fetch_kucoin(symbol: str, candle_type: str, limit: int) -> list[Candle]:
+    """Holt Kerzen von KuCoin (Antwort absteigend sortiert, neueste zuerst)."""
+    response = requests.get(
+        "https://api.kucoin.com/api/v1/market/candles",
+        params={"type": candle_type, "symbol": symbol},
+        headers=HTTP_HEADERS,
+        timeout=10,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("code") != "200000":
+        raise RuntimeError(f"KuCoin-Fehler: {payload}")
+    rows = payload.get("data") or []
+    candles = [
+        Candle(
+            time=int(row[0]),
+            open=float(row[1]),
+            close=float(row[2]),
+            high=float(row[3]),
+            low=float(row[4]),
+            volume=float(row[5]),
+        )
+        for row in rows
+    ]
+    candles.reverse()  # alt -> neu
+    return candles[-limit:]
+
+
+def _fetch_binance(symbol: str, candle_type: str, limit: int) -> list[Candle]:
+    """Holt Kerzen von Binance (Antwort aufsteigend, Zeit in Millisekunden)."""
+    response = requests.get(
+        "https://api.binance.com/api/v3/klines",
+        params={
+            "symbol": symbol.replace("-", ""),
+            "interval": _BINANCE_INTERVALS[candle_type],
+            "limit": min(limit, 1000),
+        },
+        headers=HTTP_HEADERS,
+        timeout=10,
+    )
+    response.raise_for_status()
+    rows = response.json()
+    if isinstance(rows, dict):  # Binance meldet Fehler als JSON-Objekt
+        raise RuntimeError(f"Binance-Fehler: {rows}")
+    return [
+        Candle(
+            time=int(row[0]) // 1000,
+            open=float(row[1]),
+            high=float(row[2]),
+            low=float(row[3]),
+            close=float(row[4]),
+            volume=float(row[5]),
+        )
+        for row in rows
+    ]
+
+
+def _fetch_kraken(symbol: str, candle_type: str, limit: int) -> list[Candle]:
+    """Holt Kerzen von Kraken (Antwort aufsteigend, Zeit in Sekunden)."""
+    response = requests.get(
+        "https://api.kraken.com/0/public/OHLC",
+        params={
+            "pair": symbol.replace("-", ""),
+            "interval": _KRAKEN_INTERVALS[candle_type],
+        },
+        headers=HTTP_HEADERS,
+        timeout=10,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("error"):
+        raise RuntimeError(f"Kraken-Fehler: {payload['error']}")
+    result = payload.get("result", {})
+    # Kraken legt die Kerzen unter einem Paar-Schluessel ab (plus "last").
+    pair_key = next((k for k in result if k != "last"), None)
+    if pair_key is None:
+        raise RuntimeError(f"Kraken: keine Daten fuer '{symbol}'")
+    candles = [
+        Candle(
+            time=int(row[0]),
+            open=float(row[1]),
+            high=float(row[2]),
+            low=float(row[3]),
+            close=float(row[4]),
+            volume=float(row[6]),
+        )
+        for row in result[pair_key]
+    ]
+    return candles[-limit:]
+
+
+# Verfuegbare Boersen-Adapter (Datenquelle fuer die Kursbewegungen).
+EXCHANGES = {
+    "kucoin": _fetch_kucoin,
+    "binance": _fetch_binance,
+    "kraken": _fetch_kraken,
+}
+
+
 def fetch_candles(
     symbol: str = "XRP-USDT",
     candle_type: str = "1hour",
     limit: int = 200,
     retries: int = 4,
+    exchange: str = "kucoin",
 ) -> list[Candle]:
-    """Laedt Kerzendaten von KuCoin und gibt sie chronologisch (alt -> neu) zurueck.
+    """Laedt Kerzendaten von der gewaehlten Boerse, chronologisch (alt -> neu).
 
-    KuCoin liefert maximal 1500 Kerzen und sortiert sie absteigend (neueste
-    zuerst); wir drehen die Reihenfolge um, damit die Indikatorberechnung
-    natuerlich von alt nach neu laeuft.
+    Das Symbol wird kanonisch mit Bindestrich angegeben (z. B. ``XRP-USDT``);
+    der jeweilige Adapter bringt es ins boersenspezifische Format. Bei
+    Netzwerkfehlern wird mit exponentiellem Backoff erneut versucht.
     """
     if candle_type not in CANDLE_TYPES:
         raise ValueError(
             f"Ungueltiger candle_type '{candle_type}'. "
             f"Erlaubt: {', '.join(CANDLE_TYPES)}"
         )
+    exchange = exchange.lower()
+    if exchange not in EXCHANGES:
+        raise ValueError(
+            f"Unbekannte Boerse '{exchange}'. Erlaubt: {', '.join(EXCHANGES)}"
+        )
 
-    params = {"type": candle_type, "symbol": symbol}
+    fetcher = EXCHANGES[exchange]
     last_error: Exception | None = None
-
     for attempt in range(retries):
         try:
-            response = requests.get(
-                KUCOIN_API, params=params, headers=HTTP_HEADERS, timeout=10
-            )
-            response.raise_for_status()
-            payload = response.json()
-            if payload.get("code") != "200000":
-                raise RuntimeError(f"KuCoin-Fehler: {payload}")
-
-            rows = payload.get("data") or []
-            candles = [
-                Candle(
-                    time=int(row[0]),
-                    open=float(row[1]),
-                    close=float(row[2]),
-                    high=float(row[3]),
-                    low=float(row[4]),
-                    volume=float(row[5]),
-                )
-                for row in rows
-            ]
-            candles.reverse()  # alt -> neu
-            return candles[-limit:]
-        except (requests.RequestException, ValueError, RuntimeError) as exc:
+            candles = fetcher(symbol, candle_type, limit)
+            if not candles:
+                raise RuntimeError(f"{exchange}: keine Kerzen fuer '{symbol}'")
+            return candles
+        except (requests.RequestException, ValueError, RuntimeError, KeyError) as exc:
             last_error = exc
             if attempt < retries - 1:
                 wait = 2 ** (attempt + 1)
                 print(f"Abruf fehlgeschlagen ({exc}), neuer Versuch in {wait}s ...")
                 time.sleep(wait)
 
-    raise RuntimeError(f"KuCoin-Abruf endgueltig fehlgeschlagen: {last_error}")
+    raise RuntimeError(
+        f"Abruf von {exchange} endgueltig fehlgeschlagen: {last_error}"
+    )
 
 
 def sma(values: list[float], period: int) -> list[float | None]:
@@ -781,13 +877,16 @@ def run_once(
     chart: str | None = None,
     candles: list[Candle] | None = None,
     backtest_capital: float | None = None,
+    exchange: str = "kucoin",
 ) -> SignalResult:
     """Fuehrt einen einzelnen Abruf-/Analysezyklus aus.
 
     Wird ``candles`` uebergeben, entfaellt der Netzwerkabruf (Demo-Modus).
     """
     if candles is None:
-        candles = fetch_candles(symbol=symbol, candle_type=candle_type, limit=limit)
+        candles = fetch_candles(
+            symbol=symbol, candle_type=candle_type, limit=limit, exchange=exchange
+        )
     result = generate_signal(candles)
     print_report(symbol, candle_type, result)
     if backtest_capital is not None:
@@ -828,6 +927,7 @@ def scan_symbols(
     candle_type: str = "1hour",
     limit: int = 200,
     demo: bool = False,
+    exchange: str = "kucoin",
 ) -> list[ScanRow]:
     """Wertet mehrere Paare aus und sortiert sie nach Konfidenz (absteigend)."""
     rows: list[ScanRow] = []
@@ -838,7 +938,10 @@ def scan_symbols(
                 candles = synthetic_candles(limit, seed=42 + index * 7)
             else:
                 candles = fetch_candles(
-                    symbol=symbol, candle_type=candle_type, limit=limit
+                    symbol=symbol,
+                    candle_type=candle_type,
+                    limit=limit,
+                    exchange=exchange,
                 )
             signal = generate_signal(candles)
             result = backtest(candles)
@@ -891,7 +994,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="XRP-Trading-Bot: KuCoin-Daten abrufen und Signale erzeugen."
     )
-    parser.add_argument("--symbol", default="XRP-USDT", help="Handelspaar (KuCoin).")
+    parser.add_argument(
+        "--symbol", default="XRP-USDT", help="Handelspaar, z. B. XRP-USDT."
+    )
+    parser.add_argument(
+        "--exchange",
+        default="kucoin",
+        choices=sorted(EXCHANGES),
+        help="Datenquelle fuer die Kursbewegungen (Standard: kucoin).",
+    )
     parser.add_argument(
         "--interval",
         default="1hour",
@@ -942,7 +1053,10 @@ def main() -> None:
             [s.strip().upper() for s in args.scan.split(",") if s.strip()]
             or DEFAULT_SCAN_SYMBOLS
         )
-        rows = scan_symbols(symbols, args.interval, args.limit, demo=args.demo)
+        rows = scan_symbols(
+            symbols, args.interval, args.limit, demo=args.demo,
+            exchange=args.exchange,
+        )
         print_scan(args.interval, rows)
         return
 
@@ -954,7 +1068,7 @@ def main() -> None:
             while True:
                 run_once(
                     args.symbol, args.interval, args.limit, args.chart,
-                    demo_candles, args.backtest,
+                    demo_candles, args.backtest, args.exchange,
                 )
                 time.sleep(args.watch)
         except KeyboardInterrupt:
@@ -962,7 +1076,7 @@ def main() -> None:
     else:
         run_once(
             args.symbol, args.interval, args.limit, args.chart,
-            demo_candles, args.backtest,
+            demo_candles, args.backtest, args.exchange,
         )
 
 
