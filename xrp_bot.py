@@ -295,35 +295,17 @@ def _probability(score: int) -> float:
 
 
 def _score_at(closes: list[float], ind: Indicators, i: int) -> tuple[int, list[str]]:
-    """Bewertet alle Indikatoren an Index ``i`` und gibt Score plus Begruendung."""
+    """Bewertet alle Indikatoren an Index ``i`` und gibt Score plus Begruendung.
+
+    Alle vier Indikatoren sind bewusst trendfolgend ausgerichtet, damit sie
+    sich nicht widersprechen: ein BUY entsteht nur, wenn Trend und Momentum
+    gemeinsam nach oben zeigen - nicht beim Griff ins fallende Messer.
+    """
     price = closes[i]
     score = 0
     reasons: list[str] = []
 
-    last_rsi = ind.rsi[i]
-    if last_rsi is not None:
-        if last_rsi < 30:
-            score += 1
-            reasons.append(f"RSI {last_rsi:.1f} < 30 (ueberverkauft) -> bullisch")
-        elif last_rsi > 70:
-            score -= 1
-            reasons.append(f"RSI {last_rsi:.1f} > 70 (ueberkauft) -> baerisch")
-        else:
-            reasons.append(f"RSI {last_rsi:.1f} neutral")
-
-    hist, prev_hist = ind.histogram[i], ind.histogram[i - 1] if i > 0 else None
-    if hist is not None and prev_hist is not None:
-        if prev_hist <= 0 < hist:
-            score += 1
-            reasons.append("MACD kreuzt Signallinie aufwaerts -> bullisch")
-        elif prev_hist >= 0 > hist:
-            score -= 1
-            reasons.append("MACD kreuzt Signallinie abwaerts -> baerisch")
-        elif hist > 0:
-            reasons.append("MACD ueber Signallinie (Momentum positiv)")
-        else:
-            reasons.append("MACD unter Signallinie (Momentum negativ)")
-
+    # 1) Trend: EMA12 ueber/unter EMA26.
     ema_f, ema_s = ind.ema_fast[i], ind.ema_slow[i]
     if ema_f is not None and ema_s is not None:
         if ema_f > ema_s:
@@ -333,16 +315,54 @@ def _score_at(closes: list[float], ind: Indicators, i: int) -> tuple[int, list[s
             score -= 1
             reasons.append("EMA12 < EMA26 (Abwaertstrend) -> baerisch")
 
-    upper, lower = ind.bb_upper[i], ind.bb_lower[i]
-    if upper is not None and lower is not None:
-        if price <= lower:
+    # 2) Momentum: Vorzeichen des MACD-Histogramms.
+    hist = ind.histogram[i]
+    prev_hist = ind.histogram[i - 1] if i > 0 else None
+    if hist is not None:
+        crossed_up = prev_hist is not None and prev_hist <= 0 < hist
+        crossed_down = prev_hist is not None and prev_hist >= 0 > hist
+        if hist > 0:
             score += 1
-            reasons.append("Kurs am/unter unterem Bollinger-Band -> bullisch")
-        elif price >= upper:
-            score -= 1
-            reasons.append("Kurs am/ueber oberem Bollinger-Band -> baerisch")
+            reasons.append(
+                "MACD kreuzt Signallinie aufwaerts -> bullisch"
+                if crossed_up
+                else "MACD ueber Signallinie (Momentum positiv) -> bullisch"
+            )
         else:
-            reasons.append("Kurs innerhalb der Bollinger-Baender")
+            score -= 1
+            reasons.append(
+                "MACD kreuzt Signallinie abwaerts -> baerisch"
+                if crossed_down
+                else "MACD unter Signallinie (Momentum negativ) -> baerisch"
+            )
+
+    # 3) Staerke: RSI gegen die 50er-Marke (Momentum-Lesart, nicht kontraer).
+    last_rsi = ind.rsi[i]
+    if last_rsi is not None:
+        if last_rsi >= 55:
+            score += 1
+            extra = " (ueberkauft - Vorsicht)" if last_rsi > 70 else ""
+            reasons.append(
+                f"RSI {last_rsi:.1f} > 55 (Aufwaertsmomentum){extra} -> bullisch"
+            )
+        elif last_rsi <= 45:
+            score -= 1
+            extra = " (ueberverkauft)" if last_rsi < 30 else ""
+            reasons.append(
+                f"RSI {last_rsi:.1f} < 45 (Abwaertsmomentum){extra} -> baerisch"
+            )
+        else:
+            reasons.append(f"RSI {last_rsi:.1f} neutral")
+
+    # 4) Lage: Kurs ueber/unter der Bollinger-Mittellinie (SMA20).
+    middle = ind.bb_middle[i]
+    if middle is not None:
+        if price > middle:
+            score += 1
+            reasons.append("Kurs ueber Bollinger-Mittellinie -> bullisch")
+        else:
+            score -= 1
+            reasons.append("Kurs unter Bollinger-Mittellinie -> baerisch")
 
     return score, reasons
 
