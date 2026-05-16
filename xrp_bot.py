@@ -11,6 +11,7 @@ Signale sind keine Anlageempfehlung. Es werden keine echten Orders platziert.
 from __future__ import annotations
 
 import argparse
+import math
 import time
 from dataclasses import dataclass
 
@@ -227,41 +228,79 @@ def bollinger_bands(
     return upper, middle, lower
 
 
+# Mindestanzahl Kerzen fuer eine verlaessliche Analyse (laengster Indikator
+# ist der MACD mit 26+9 Perioden).
+MIN_CANDLES = 35
+
+# Anzahl der stimmberechtigten Indikatoren -> maximaler Betrag des Scores.
+MAX_SCORE = 4
+
+# Steilheit der Logistik-Funktion, die den Score in eine Wahrscheinlichkeit
+# uebersetzt. Score 0 -> 50 %, Score +-2 -> ~86 %, Score +-4 -> ~97 %.
+PROB_STEEPNESS = 0.9
+
+
+@dataclass
+class Indicators:
+    """Vollstaendige Indikator-Zeitreihen ueber alle Kerzen."""
+
+    rsi: list[float | None]
+    macd_line: list[float | None]
+    macd_signal: list[float | None]
+    histogram: list[float | None]
+    ema_fast: list[float | None]
+    ema_slow: list[float | None]
+    bb_upper: list[float | None]
+    bb_middle: list[float | None]
+    bb_lower: list[float | None]
+
+
 @dataclass
 class SignalResult:
-    """Ergebnis der Signalauswertung fuer die jeweils letzte Kerze."""
+    """Ergebnis der Signalauswertung an einer bestimmten Kerze."""
 
     decision: str  # "BUY", "SELL" oder "HOLD"
     score: int
     price: float
+    prob_up: float  # Wahrscheinlichkeit fuer steigende Tendenz (0..1)
+    confidence: float  # Wahrscheinlichkeit der getroffenen Entscheidung (0..1)
     reasons: list[str]
     indicators: dict[str, float]
 
 
-def generate_signal(candles: list[Candle]) -> SignalResult:
-    """Wertet RSI, MACD, gleitende Durchschnitte und Bollinger-Baender aus.
+def compute_indicators(closes: list[float]) -> Indicators:
+    """Berechnet alle Indikator-Zeitreihen einmalig fuer die Kursreihe."""
+    macd_line, macd_signal, histogram = macd(closes)
+    bb_upper, bb_middle, bb_lower = bollinger_bands(closes, 20, 2.0)
+    return Indicators(
+        rsi=rsi(closes, 14),
+        macd_line=macd_line,
+        macd_signal=macd_signal,
+        histogram=histogram,
+        ema_fast=ema(closes, 12),
+        ema_slow=ema(closes, 26),
+        bb_upper=bb_upper,
+        bb_middle=bb_middle,
+        bb_lower=bb_lower,
+    )
 
-    Jeder Indikator vergibt eine Stimme (+1 bullisch, -1 baerisch). Die Summe
-    ergibt einen Score; ab +2 lautet die Entscheidung BUY, ab -2 SELL.
+
+def _probability(score: int) -> float:
+    """Uebersetzt einen Score in eine Wahrscheinlichkeit fuer steigende Kurse.
+
+    Dies ist eine heuristische Konfidenz aus der Uebereinstimmung der
+    Indikatoren - KEINE statistische Vorhersage des Marktes.
     """
-    closes = [c.close for c in candles]
-    if len(closes) < 35:
-        raise ValueError(
-            f"Zu wenige Kerzen ({len(closes)}) fuer eine verlaessliche Analyse; "
-            "mindestens 35 erforderlich."
-        )
+    return 1.0 / (1.0 + math.exp(-PROB_STEEPNESS * score))
 
-    rsi_values = rsi(closes, 14)
-    macd_line, signal_line, histogram = macd(closes)
-    ema_fast = ema(closes, 12)
-    ema_slow = ema(closes, 26)
-    upper, middle, lower = bollinger_bands(closes, 20, 2.0)
 
-    price = closes[-1]
+def _score_at(closes: list[float], ind: Indicators, i: int) -> tuple[int, list[str]]:
+    """Bewertet alle Indikatoren an Index ``i`` und gibt Score plus Begruendung."""
+    price = closes[i]
     score = 0
     reasons: list[str] = []
 
-    last_rsi = rsi_values[-1]
+    last_rsi = ind.rsi[i]
     if last_rsi is not None:
         if last_rsi < 30:
             score += 1
@@ -272,54 +311,118 @@ def generate_signal(candles: list[Candle]) -> SignalResult:
         else:
             reasons.append(f"RSI {last_rsi:.1f} neutral")
 
-    if histogram[-1] is not None and histogram[-2] is not None:
-        if histogram[-2] <= 0 < histogram[-1]:
+    hist, prev_hist = ind.histogram[i], ind.histogram[i - 1] if i > 0 else None
+    if hist is not None and prev_hist is not None:
+        if prev_hist <= 0 < hist:
             score += 1
             reasons.append("MACD kreuzt Signallinie aufwaerts -> bullisch")
-        elif histogram[-2] >= 0 > histogram[-1]:
+        elif prev_hist >= 0 > hist:
             score -= 1
             reasons.append("MACD kreuzt Signallinie abwaerts -> baerisch")
-        elif histogram[-1] > 0:
+        elif hist > 0:
             reasons.append("MACD ueber Signallinie (Momentum positiv)")
         else:
             reasons.append("MACD unter Signallinie (Momentum negativ)")
 
-    if ema_fast[-1] is not None and ema_slow[-1] is not None:
-        if ema_fast[-1] > ema_slow[-1]:
+    ema_f, ema_s = ind.ema_fast[i], ind.ema_slow[i]
+    if ema_f is not None and ema_s is not None:
+        if ema_f > ema_s:
             score += 1
             reasons.append("EMA12 > EMA26 (Aufwaertstrend) -> bullisch")
         else:
             score -= 1
             reasons.append("EMA12 < EMA26 (Abwaertstrend) -> baerisch")
 
-    if upper[-1] is not None and lower[-1] is not None:
-        if price <= lower[-1]:
+    upper, lower = ind.bb_upper[i], ind.bb_lower[i]
+    if upper is not None and lower is not None:
+        if price <= lower:
             score += 1
             reasons.append("Kurs am/unter unterem Bollinger-Band -> bullisch")
-        elif price >= upper[-1]:
+        elif price >= upper:
             score -= 1
             reasons.append("Kurs am/ueber oberem Bollinger-Band -> baerisch")
         else:
             reasons.append("Kurs innerhalb der Bollinger-Baender")
 
+    return score, reasons
+
+
+def _decision_from(score: int) -> str:
     if score >= 2:
-        decision = "BUY"
-    elif score <= -2:
-        decision = "SELL"
-    else:
-        decision = "HOLD"
+        return "BUY"
+    if score <= -2:
+        return "SELL"
+    return "HOLD"
+
+
+def _result_at(closes: list[float], ind: Indicators, i: int) -> SignalResult:
+    """Baut ein vollstaendiges ``SignalResult`` fuer Index ``i``."""
+    score, reasons = _score_at(closes, ind, i)
+    decision = _decision_from(score)
+    prob_up = _probability(score)
+    confidence = prob_up if decision == "BUY" else (
+        1.0 - prob_up if decision == "SELL" else max(prob_up, 1.0 - prob_up)
+    )
+
+    def at(series: list[float | None]) -> float:
+        value = series[i]
+        return value if value is not None else float("nan")
 
     indicators = {
-        "rsi": last_rsi if last_rsi is not None else float("nan"),
-        "macd": macd_line[-1] if macd_line[-1] is not None else float("nan"),
-        "macd_signal": signal_line[-1] if signal_line[-1] is not None else float("nan"),
-        "ema_fast": ema_fast[-1] if ema_fast[-1] is not None else float("nan"),
-        "ema_slow": ema_slow[-1] if ema_slow[-1] is not None else float("nan"),
-        "bb_upper": upper[-1] if upper[-1] is not None else float("nan"),
-        "bb_middle": middle[-1] if middle[-1] is not None else float("nan"),
-        "bb_lower": lower[-1] if lower[-1] is not None else float("nan"),
+        "rsi": at(ind.rsi),
+        "macd": at(ind.macd_line),
+        "macd_signal": at(ind.macd_signal),
+        "ema_fast": at(ind.ema_fast),
+        "ema_slow": at(ind.ema_slow),
+        "bb_upper": at(ind.bb_upper),
+        "bb_middle": at(ind.bb_middle),
+        "bb_lower": at(ind.bb_lower),
     }
-    return SignalResult(decision, score, price, reasons, indicators)
+    return SignalResult(
+        decision=decision,
+        score=score,
+        price=closes[i],
+        prob_up=prob_up,
+        confidence=confidence,
+        reasons=reasons,
+        indicators=indicators,
+    )
+
+
+def generate_signal(candles: list[Candle]) -> SignalResult:
+    """Wertet RSI, MACD, gleitende Durchschnitte und Bollinger-Baender aus.
+
+    Jeder Indikator vergibt eine Stimme (+1 bullisch, -1 baerisch). Die Summe
+    ergibt einen Score; ab +2 lautet die Entscheidung BUY, ab -2 SELL. Der
+    Score wird zusaetzlich in eine Wahrscheinlichkeit uebersetzt.
+    """
+    closes = [c.close for c in candles]
+    if len(closes) < MIN_CANDLES:
+        raise ValueError(
+            f"Zu wenige Kerzen ({len(closes)}) fuer eine verlaessliche Analyse; "
+            f"mindestens {MIN_CANDLES} erforderlich."
+        )
+    ind = compute_indicators(closes)
+    return _result_at(closes, ind, len(closes) - 1)
+
+
+def signal_history(candles: list[Candle]) -> list[SignalResult]:
+    """Berechnet das Signal an jeder Kerze (rollierende Auswertung).
+
+    Das Ergebnis hat dieselbe Laenge wie ``candles``; vor genuegend Daten
+    enthaelt es ``HOLD`` mit neutraler Wahrscheinlichkeit.
+    """
+    closes = [c.close for c in candles]
+    ind = compute_indicators(closes)
+    results: list[SignalResult] = []
+    for i in range(len(closes)):
+        if i < MIN_CANDLES - 1:
+            results.append(
+                SignalResult("HOLD", 0, closes[i], 0.5, 0.5, [], {})
+            )
+        else:
+            results.append(_result_at(closes, ind, i))
+    return results
 
 
 def print_report(symbol: str, candle_type: str, result: SignalResult) -> None:
@@ -346,17 +449,213 @@ def print_report(symbol: str, candle_type: str, result: SignalResult) -> None:
     for reason in result.reasons:
         print(f"  - {reason}")
     print("-" * 56)
-    print(f"  SCORE        : {result.score:+d}")
-    print(f"  >>> SIGNAL   : {result.decision}")
+    print(f"  SCORE        : {result.score:+d} (von +-{MAX_SCORE})")
+    print(
+        f"  Tendenz      : {result.prob_up * 100:.1f}% steigend / "
+        f"{(1 - result.prob_up) * 100:.1f}% fallend"
+    )
+    print(
+        f"  >>> SIGNAL   : {result.decision}  "
+        f"(Konfidenz {result.confidence * 100:.1f}%)"
+    )
     print("=" * 56)
     print("  Hinweis: keine Anlageberatung. Es werden keine Orders platziert.")
+    print("  Die Wahrscheinlichkeit ist eine Heuristik aus der Indikator-")
+    print("  Uebereinstimmung, keine statistische Marktprognose.")
 
 
-def run_once(symbol: str, candle_type: str, limit: int) -> SignalResult:
-    """Fuehrt einen einzelnen Abruf-/Analysezyklus aus."""
-    candles = fetch_candles(symbol=symbol, candle_type=candle_type, limit=limit)
+def _nan(series: list[float | None]) -> list[float]:
+    """Ersetzt ``None`` durch ``NaN``, damit matplotlib Luecken sauber zeichnet."""
+    return [v if v is not None else float("nan") for v in series]
+
+
+def _signal_transitions(
+    history: list[SignalResult],
+) -> tuple[list[tuple[int, SignalResult]], list[tuple[int, SignalResult]]]:
+    """Findet die Kerzen, an denen das Signal nach BUY bzw. SELL wechselt."""
+    buys: list[tuple[int, SignalResult]] = []
+    sells: list[tuple[int, SignalResult]] = []
+    previous = "HOLD"
+    for i, result in enumerate(history):
+        if result.decision in ("BUY", "SELL"):
+            if result.decision != previous:
+                (buys if result.decision == "BUY" else sells).append((i, result))
+            previous = result.decision
+    return buys, sells
+
+
+def plot_chart(
+    symbol: str,
+    candle_type: str,
+    candles: list[Candle],
+    output: str = "xrp_signals.png",
+) -> str:
+    """Zeichnet Kurs, Indikatoren und Buy/Sell-Signale und speichert ein PNG.
+
+    Markiert werden Signalwechsel: ein gruener Pfeil, sobald die Auswertung
+    auf BUY kippt, ein roter Pfeil beim Wechsel auf SELL - jeweils mit der
+    Konfidenz (Wahrscheinlichkeit) der Entscheidung beschriftet.
+    """
+    from datetime import datetime
+
+    import matplotlib
+
+    matplotlib.use("Agg")  # kein Display noetig
+    import matplotlib.pyplot as plt
+
+    if len(candles) < MIN_CANDLES:
+        raise ValueError(
+            f"Zu wenige Kerzen ({len(candles)}) fuer einen Chart; "
+            f"mindestens {MIN_CANDLES} erforderlich."
+        )
+
+    closes = [c.close for c in candles]
+    times = [datetime.fromtimestamp(c.time) for c in candles]
+    ind = compute_indicators(closes)
+    history = signal_history(candles)
+    buys, sells = _signal_transitions(history)
+
+    fig, (ax_price, ax_rsi, ax_macd) = plt.subplots(
+        3,
+        1,
+        figsize=(14, 10),
+        sharex=True,
+        gridspec_kw={"height_ratios": [3, 1, 1]},
+    )
+    last = history[-1]
+    fig.suptitle(
+        f"{symbol}  -  Intervall {candle_type}  -  "
+        f"aktuelles Signal: {last.decision} "
+        f"({last.confidence * 100:.0f}% Konfidenz)",
+        fontsize=14,
+        fontweight="bold",
+    )
+
+    # --- Kurs, Bollinger-Baender, EMAs ---
+    ax_price.fill_between(
+        times,
+        _nan(ind.bb_lower),
+        _nan(ind.bb_upper),
+        color="#b0bec5",
+        alpha=0.35,
+        label="Bollinger-Baender (20, 2s)",
+    )
+    ax_price.plot(times, closes, color="#1565c0", lw=1.4, label="Schlusskurs")
+    ax_price.plot(
+        times, _nan(ind.ema_fast), color="#fb8c00", lw=1.0, label="EMA 12"
+    )
+    ax_price.plot(
+        times, _nan(ind.ema_slow), color="#6a1b9a", lw=1.0, label="EMA 26"
+    )
+
+    for i, result in buys:
+        ax_price.scatter(
+            times[i], closes[i], marker="^", s=170, color="#2e7d32", zorder=5
+        )
+        ax_price.annotate(
+            f"BUY\n{result.confidence * 100:.0f}%",
+            (times[i], closes[i]),
+            textcoords="offset points",
+            xytext=(0, -38),
+            ha="center",
+            fontsize=8,
+            color="#2e7d32",
+            fontweight="bold",
+        )
+    for i, result in sells:
+        ax_price.scatter(
+            times[i], closes[i], marker="v", s=170, color="#c62828", zorder=5
+        )
+        ax_price.annotate(
+            f"SELL\n{result.confidence * 100:.0f}%",
+            (times[i], closes[i]),
+            textcoords="offset points",
+            xytext=(0, 22),
+            ha="center",
+            fontsize=8,
+            color="#c62828",
+            fontweight="bold",
+        )
+
+    ax_price.set_ylabel("Preis (USDT)")
+    ax_price.legend(loc="upper left", fontsize=8)
+    ax_price.grid(alpha=0.3)
+
+    # --- RSI ---
+    ax_rsi.plot(times, _nan(ind.rsi), color="#00838f", lw=1.1)
+    ax_rsi.axhline(70, color="#c62828", ls="--", lw=0.8)
+    ax_rsi.axhline(30, color="#2e7d32", ls="--", lw=0.8)
+    ax_rsi.fill_between(times, 70, 100, color="#c62828", alpha=0.08)
+    ax_rsi.fill_between(times, 0, 30, color="#2e7d32", alpha=0.08)
+    ax_rsi.set_ylabel("RSI (14)")
+    ax_rsi.set_ylim(0, 100)
+    ax_rsi.grid(alpha=0.3)
+
+    # --- MACD ---
+    hist = _nan(ind.histogram)
+    colors = ["#2e7d32" if (h == h and h >= 0) else "#c62828" for h in hist]
+    ax_macd.bar(times, hist, color=colors, width=0.8 * (
+        (times[1] - times[0]) if len(times) > 1 else 1
+    ), alpha=0.5)
+    ax_macd.plot(times, _nan(ind.macd_line), color="#1565c0", lw=1.0, label="MACD")
+    ax_macd.plot(
+        times, _nan(ind.macd_signal), color="#fb8c00", lw=1.0, label="Signal"
+    )
+    ax_macd.axhline(0, color="#777777", lw=0.7)
+    ax_macd.set_ylabel("MACD")
+    ax_macd.legend(loc="upper left", fontsize=8)
+    ax_macd.grid(alpha=0.3)
+
+    fig.autofmt_xdate()
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(output, dpi=110)
+    plt.close(fig)
+    return output
+
+
+def synthetic_candles(count: int = 200, seed: int = 42) -> list[Candle]:
+    """Erzeugt nachvollziehbare Pseudo-Kursdaten fuer Demo/Tests ohne Netzwerk."""
+    import random
+
+    rng = random.Random(seed)
+    price = 2.30
+    candles: list[Candle] = []
+    now = int(time.time()) - count * 3600
+    for i in range(count):
+        # sanfter Trend ueberlagert mit Rauschen und einer Welle
+        drift = 0.012 * math.sin(i / 18.0)
+        price = max(0.05, price * (1 + drift + rng.uniform(-0.012, 0.012)))
+        candles.append(
+            Candle(
+                time=now + i * 3600,
+                open=price,
+                close=price,
+                high=price * 1.004,
+                low=price * 0.996,
+                volume=rng.uniform(1e6, 5e6),
+            )
+        )
+    return candles
+
+
+def run_once(
+    symbol: str,
+    candle_type: str,
+    limit: int,
+    chart: str | None = None,
+    candles: list[Candle] | None = None,
+) -> SignalResult:
+    """Fuehrt einen einzelnen Abruf-/Analysezyklus aus.
+
+    Wird ``candles`` uebergeben, entfaellt der Netzwerkabruf (Demo-Modus).
+    """
+    if candles is None:
+        candles = fetch_candles(symbol=symbol, candle_type=candle_type, limit=limit)
     result = generate_signal(candles)
     print_report(symbol, candle_type, result)
+    if chart:
+        path = plot_chart(symbol, candle_type, candles, chart)
+        print(f"  Chart gespeichert: {path}")
     return result
 
 
@@ -380,18 +679,34 @@ def main() -> None:
         metavar="SEKUNDEN",
         help="Dauerbetrieb: Analyse alle N Sekunden wiederholen.",
     )
+    parser.add_argument(
+        "--chart",
+        nargs="?",
+        const="xrp_signals.png",
+        metavar="DATEI",
+        help="Chart mit Buy/Sell-Signalen als PNG speichern.",
+    )
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="Synthetische Daten statt KuCoin-Abruf verwenden (ohne Netzwerk).",
+    )
     args = parser.parse_args()
+
+    demo_candles = synthetic_candles(args.limit) if args.demo else None
 
     if args.watch:
         print(f"Dauerbetrieb aktiv (alle {args.watch}s). Abbruch mit STRG+C.\n")
         try:
             while True:
-                run_once(args.symbol, args.interval, args.limit)
+                run_once(
+                    args.symbol, args.interval, args.limit, args.chart, demo_candles
+                )
                 time.sleep(args.watch)
         except KeyboardInterrupt:
             print("\nBeendet.")
     else:
-        run_once(args.symbol, args.interval, args.limit)
+        run_once(args.symbol, args.interval, args.limit, args.chart, demo_candles)
 
 
 if __name__ == "__main__":
