@@ -799,6 +799,94 @@ def run_once(
     return result
 
 
+# Liquide Standard-Paare fuer den Wahrscheinlichkeits-Scan.
+DEFAULT_SCAN_SYMBOLS = [
+    "BTC-USDT",
+    "ETH-USDT",
+    "XRP-USDT",
+    "SOL-USDT",
+    "BNB-USDT",
+    "ADA-USDT",
+]
+
+
+@dataclass
+class ScanRow:
+    """Wahrscheinlichkeits-Kennzahlen eines Handelspaars."""
+
+    symbol: str
+    decision: str
+    prob_up: float  # heuristische Tendenz fuer steigende Kurse (0..1)
+    confidence: float  # Wahrscheinlichkeit der getroffenen Entscheidung
+    backtest_return: float  # Rendite des Backtests in Prozent
+    win_rate: float | None  # Anteil gewinnender Trades (0..1) oder None
+    trades: int
+
+
+def scan_symbols(
+    symbols: list[str],
+    candle_type: str = "1hour",
+    limit: int = 200,
+    demo: bool = False,
+) -> list[ScanRow]:
+    """Wertet mehrere Paare aus und sortiert sie nach Konfidenz (absteigend)."""
+    rows: list[ScanRow] = []
+    for index, symbol in enumerate(symbols):
+        try:
+            if demo:
+                # je Paar ein anderer Seed -> unterschiedliche Demo-Verlaeufe
+                candles = synthetic_candles(limit, seed=42 + index * 7)
+            else:
+                candles = fetch_candles(
+                    symbol=symbol, candle_type=candle_type, limit=limit
+                )
+            signal = generate_signal(candles)
+            result = backtest(candles)
+            closed = result.wins + result.losses
+            rows.append(
+                ScanRow(
+                    symbol=symbol,
+                    decision=signal.decision,
+                    prob_up=signal.prob_up,
+                    confidence=signal.confidence,
+                    backtest_return=result.return_pct,
+                    win_rate=(result.wins / closed) if closed else None,
+                    trades=result.num_trades,
+                )
+            )
+        except (RuntimeError, ValueError) as exc:
+            print(f"  {symbol}: uebersprungen ({exc})")
+
+    rows.sort(key=lambda row: row.confidence, reverse=True)
+    return rows
+
+
+def print_scan(candle_type: str, rows: list[ScanRow]) -> None:
+    """Gibt den Wahrscheinlichkeits-Scan als Tabelle aus."""
+    print("=" * 74)
+    print(f"  WAHRSCHEINLICHKEITS-SCAN  |  Intervall: {candle_type}")
+    print("=" * 74)
+    print(
+        f"  {'Paar':<11}{'Signal':<7}{'P(steigt)':>10}"
+        f"{'Konfidenz':>11}{'Trefferq.':>11}{'Backtest':>11}"
+    )
+    print("  " + "-" * 70)
+    for row in rows:
+        win_rate = f"{row.win_rate * 100:.0f}%" if row.win_rate is not None else "-"
+        print(
+            f"  {row.symbol:<11}{row.decision:<7}"
+            f"{row.prob_up * 100:>9.1f}%"
+            f"{row.confidence * 100:>10.1f}%"
+            f"{win_rate:>11}"
+            f"{row.backtest_return:>+10.1f}%"
+        )
+    print("=" * 74)
+    print("  Sortiert nach Konfidenz. P(steigt) ist eine Heuristik aus der")
+    print("  Indikator-Uebereinstimmung - KEINE echte Marktwahrscheinlichkeit.")
+    print("  Trefferquote und Backtest beziehen sich auf die Vergangenheit")
+    print("  und sind keine Garantie fuer kuenftige Ergebnisse.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="XRP-Trading-Bot: KuCoin-Daten abrufen und Signale erzeugen."
@@ -839,7 +927,24 @@ def main() -> None:
         metavar="KAPITAL",
         help="Strategie ueber die Kerzen simulieren (Standard-Startkapital 100).",
     )
+    parser.add_argument(
+        "--scan",
+        nargs="?",
+        const="",
+        metavar="PAARE",
+        help="Mehrere Paare nach Wahrscheinlichkeit vergleichen "
+        "(kommagetrennt; ohne Angabe Standardpaare).",
+    )
     args = parser.parse_args()
+
+    if args.scan is not None:
+        symbols = (
+            [s.strip().upper() for s in args.scan.split(",") if s.strip()]
+            or DEFAULT_SCAN_SYMBOLS
+        )
+        rows = scan_symbols(symbols, args.interval, args.limit, demo=args.demo)
+        print_scan(args.interval, rows)
+        return
 
     demo_candles = synthetic_candles(args.limit) if args.demo else None
 
