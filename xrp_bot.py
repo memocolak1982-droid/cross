@@ -445,6 +445,122 @@ def signal_history(candles: list[Candle]) -> list[SignalResult]:
     return results
 
 
+# KuCoin-Spot-Handelsgebuehr fuer Standardnutzer (Taker, Stand 2024): 0,1 %.
+KUCOIN_FEE_RATE = 0.001
+
+
+@dataclass
+class Trade:
+    """Ein einzelner ausgefuehrter Ein- oder Ausstieg im Backtest."""
+
+    index: int
+    side: str  # "BUY" oder "SELL"
+    price: float
+    capital_after: float  # Portfoliowert (Bargeld + Position) nach dem Trade
+
+
+@dataclass
+class BacktestResult:
+    """Ergebnis einer Strategiesimulation ueber historische Kerzen."""
+
+    start_capital: float
+    final_capital: float
+    profit: float
+    return_pct: float
+    buy_and_hold_pct: float
+    num_trades: int
+    wins: int
+    losses: int
+    fee_rate: float
+    fees_paid: float
+    trades: list[Trade]
+
+
+def backtest(
+    candles: list[Candle],
+    start_capital: float = 100.0,
+    fee_rate: float = KUCOIN_FEE_RATE,
+) -> BacktestResult:
+    """Simuliert die Strategie: bei BUY voll einsteigen, bei SELL komplett raus.
+
+    Pro Trade wird die Handelsgebuehr abgezogen. Eine offene Position am Ende
+    wird zum letzten Kurs bewertet. Es findet KEIN echter Handel statt - dies
+    ist eine Vergangenheitssimulation und keine Gewinnprognose.
+    """
+    history = signal_history(candles)
+    closes = [c.close for c in candles]
+
+    cash = start_capital
+    coins = 0.0
+    fees_paid = 0.0
+    in_position = False
+    entry_value = 0.0
+    trades: list[Trade] = []
+    wins = 0
+    losses = 0
+
+    for i, result in enumerate(history):
+        price = closes[i]
+        if result.decision == "BUY" and not in_position:
+            fee = cash * fee_rate
+            fees_paid += fee
+            coins = (cash - fee) / price
+            cash = 0.0
+            in_position = True
+            entry_value = coins * price
+            trades.append(Trade(i, "BUY", price, coins * price))
+        elif result.decision == "SELL" and in_position:
+            gross = coins * price
+            fee = gross * fee_rate
+            fees_paid += fee
+            cash = gross - fee
+            coins = 0.0
+            in_position = False
+            if cash >= entry_value:
+                wins += 1
+            else:
+                losses += 1
+            trades.append(Trade(i, "SELL", price, cash))
+
+    final_capital = cash + coins * closes[-1]
+    profit = final_capital - start_capital
+    return_pct = profit / start_capital * 100
+    buy_and_hold_pct = (closes[-1] / closes[0] - 1) * 100
+
+    return BacktestResult(
+        start_capital=start_capital,
+        final_capital=final_capital,
+        profit=profit,
+        return_pct=return_pct,
+        buy_and_hold_pct=buy_and_hold_pct,
+        num_trades=len(trades),
+        wins=wins,
+        losses=losses,
+        fee_rate=fee_rate,
+        fees_paid=fees_paid,
+        trades=trades,
+    )
+
+
+def print_backtest(symbol: str, candle_type: str, result: BacktestResult) -> None:
+    """Gibt das Backtest-Ergebnis als lesbare Tabelle aus."""
+    print("=" * 56)
+    print(f"  BACKTEST  {symbol}  |  Intervall: {candle_type}")
+    print("=" * 56)
+    print(f"  Startkapital     : {result.start_capital:.2f}")
+    print(f"  Endkapital       : {result.final_capital:.2f}")
+    print(f"  Gewinn / Verlust : {result.profit:+.2f}  ({result.return_pct:+.2f}%)")
+    print(f"  Buy & Hold-Ref.  : {result.buy_and_hold_pct:+.2f}%")
+    print(f"  Trades           : {result.num_trades} "
+          f"(abgeschlossen: {result.wins} Gewinn / {result.losses} Verlust)")
+    print(f"  Gebuehren gesamt : {result.fees_paid:.2f} "
+          f"(bei {result.fee_rate * 100:.2f}% pro Trade)")
+    print("=" * 56)
+    print("  ACHTUNG: Simulation auf historischen/synthetischen Daten.")
+    print("  Vergangene Ergebnisse sind KEINE Garantie fuer die Zukunft.")
+    print("  Es gibt keinen sicheren Gewinn - Trading birgt Verlustrisiko.")
+
+
 def print_report(symbol: str, candle_type: str, result: SignalResult) -> None:
     """Gibt eine lesbare Zusammenfassung der Analyse aus."""
     print("=" * 56)
@@ -664,6 +780,7 @@ def run_once(
     limit: int,
     chart: str | None = None,
     candles: list[Candle] | None = None,
+    backtest_capital: float | None = None,
 ) -> SignalResult:
     """Fuehrt einen einzelnen Abruf-/Analysezyklus aus.
 
@@ -673,6 +790,9 @@ def run_once(
         candles = fetch_candles(symbol=symbol, candle_type=candle_type, limit=limit)
     result = generate_signal(candles)
     print_report(symbol, candle_type, result)
+    if backtest_capital is not None:
+        print()
+        print_backtest(symbol, candle_type, backtest(candles, backtest_capital))
     if chart:
         path = plot_chart(symbol, candle_type, candles, chart)
         print(f"  Chart gespeichert: {path}")
@@ -711,6 +831,14 @@ def main() -> None:
         action="store_true",
         help="Synthetische Daten statt KuCoin-Abruf verwenden (ohne Netzwerk).",
     )
+    parser.add_argument(
+        "--backtest",
+        nargs="?",
+        type=float,
+        const=100.0,
+        metavar="KAPITAL",
+        help="Strategie ueber die Kerzen simulieren (Standard-Startkapital 100).",
+    )
     args = parser.parse_args()
 
     demo_candles = synthetic_candles(args.limit) if args.demo else None
@@ -720,13 +848,17 @@ def main() -> None:
         try:
             while True:
                 run_once(
-                    args.symbol, args.interval, args.limit, args.chart, demo_candles
+                    args.symbol, args.interval, args.limit, args.chart,
+                    demo_candles, args.backtest,
                 )
                 time.sleep(args.watch)
         except KeyboardInterrupt:
             print("\nBeendet.")
     else:
-        run_once(args.symbol, args.interval, args.limit, args.chart, demo_candles)
+        run_once(
+            args.symbol, args.interval, args.limit, args.chart,
+            demo_candles, args.backtest,
+        )
 
 
 if __name__ == "__main__":
